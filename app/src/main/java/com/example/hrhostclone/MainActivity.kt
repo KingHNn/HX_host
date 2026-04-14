@@ -307,6 +307,9 @@ object NcnnEngine {
         private set
     var isInitialized: Boolean = false
         private set
+    @Volatile
+    var currentModelBase: String = ""
+        private set
 
     fun tryLoadLibrary() {
         isLoaded = try {
@@ -321,6 +324,11 @@ object NcnnEngine {
         if (!isLoaded) return false
         val ok = runCatching { init(param, bin) }.getOrDefault(false)
         isInitialized = ok
+        currentModelBase = if (ok) {
+            File(param).nameWithoutExtension
+        } else {
+            ""
+        }
         return ok
     }
 
@@ -370,6 +378,17 @@ object OnnxEngine {
         private set
 
     val runtimeLogs: StateFlow<List<String>> = _runtimeLogs.asStateFlow()
+
+    fun modelInputResolutionLabel(): String {
+        if (!isInitialized) return "未加载"
+        return "${inputW.coerceAtLeast(1)}x${inputH.coerceAtLeast(1)}x${inputChannels.coerceAtLeast(1)}"
+    }
+
+    fun modelTensorSummaryLabel(): String {
+        if (!isInitialized) return "等待加载 ONNX"
+        val layout = if (inputNchw) "NCHW" else "NHWC"
+        return "$layout | ${tensorTypeLabel(inputType)} -> ${tensorTypeLabel(outputType)}"
+    }
 
     fun setNnapiEnabled(enabled: Boolean) {
         if (nnapiEnabled == enabled) return
@@ -673,6 +692,21 @@ object OnnxEngine {
 
     private fun runtimeTimestamp(): String {
         return String.format(Locale.ROOT, "%1\$tT.%1\$tL", System.currentTimeMillis())
+    }
+
+    private fun tensorTypeLabel(type: ai.onnxruntime.OnnxJavaType): String {
+        return when (type) {
+            ai.onnxruntime.OnnxJavaType.FLOAT -> "FP32"
+            ai.onnxruntime.OnnxJavaType.FLOAT16 -> "FP16"
+            ai.onnxruntime.OnnxJavaType.DOUBLE -> "FP64"
+            ai.onnxruntime.OnnxJavaType.UINT8 -> "UINT8"
+            ai.onnxruntime.OnnxJavaType.INT8 -> "INT8"
+            ai.onnxruntime.OnnxJavaType.INT16 -> "INT16"
+            ai.onnxruntime.OnnxJavaType.INT32 -> "INT32"
+            ai.onnxruntime.OnnxJavaType.INT64 -> "INT64"
+            ai.onnxruntime.OnnxJavaType.BOOL -> "BOOL"
+            else -> type.name.uppercase(Locale.ROOT)
+        }
     }
 
     private fun Long.toIntOrNullPositive(): Int? {
@@ -3764,8 +3798,23 @@ fun MonitorScreen(
                         modifier = Modifier.weight(1f)
                     ) { onShowConfidencePercentChange(!showConfidencePercent) }
                 }
-                Box(Modifier.fillMaxWidth().height(28.dp), contentAlignment = Alignment.CenterEnd) {
-                    Text("256 | INT8", fontWeight = FontWeight.Bold, color = Color(0xFF555555), fontSize = 16.sp)
+                val modelSummary = currentModelParameterSummary(selectedModel)
+                Column(
+                    modifier = Modifier.fillMaxWidth().height(38.dp),
+                    horizontalAlignment = Alignment.End,
+                    verticalArrangement = Arrangement.Center
+                ) {
+                    Text(
+                        modelSummary.headline,
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFF555555),
+                        fontSize = 16.sp
+                    )
+                    Text(
+                        modelSummary.detail,
+                        color = Color(0xFF6D6D6D),
+                        fontSize = 11.sp
+                    )
                 }
                 Button(
                     onClick = { onToggleRun(!running) },
@@ -4008,6 +4057,11 @@ private data class BackendBadgeSpec(
     val contentColor: Color = Color.White
 )
 
+private data class ModelParameterSummary(
+    val headline: String,
+    val detail: String
+)
+
 @Composable
 private fun runtimeBackendBadges(): List<BackendBadgeSpec> {
     return when (RuntimeBridge.selectedModelKind) {
@@ -4028,6 +4082,32 @@ private fun runtimeBackendBadges(): List<BackendBadgeSpec> {
         )
         ModelKind.FILE -> listOf(
             BackendBadgeSpec(label = "未加载模型", containerColor = Color(0xFF8A8A8A))
+        )
+    }
+}
+
+private fun currentModelParameterSummary(selectedModel: String): ModelParameterSummary {
+    return when (RuntimeBridge.selectedModelKind) {
+        ModelKind.ONNX -> ModelParameterSummary(
+            headline = OnnxEngine.modelInputResolutionLabel(),
+            detail = OnnxEngine.modelTensorSummaryLabel()
+        )
+        ModelKind.NCNN -> {
+            val loadedName = NcnnEngine.currentModelBase.ifBlank {
+                selectedModel.substringBefore(" (NCNN)").ifBlank { "NCNN" }
+            }
+            ModelParameterSummary(
+                headline = loadedName,
+                detail = if (NcnnEngine.isInitialized) "PARAM/BIN | NATIVE" else "等待加载 NCNN"
+            )
+        }
+        ModelKind.FILE -> ModelParameterSummary(
+            headline = "未加载模型",
+            detail = if (selectedModel.isBlank() || selectedModel == "未选择模型") {
+                "请选择模型"
+            } else {
+                selectedModel
+            }
         )
     }
 }
