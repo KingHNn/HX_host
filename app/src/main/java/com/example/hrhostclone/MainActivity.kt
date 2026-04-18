@@ -172,6 +172,22 @@ private const val AUTO_CONFIG_KEY = "app_auto_config_json"
 private const val ONNX_LOG_TAG = "HXHostOnnx"
 private const val ONNX_RUNTIME_LOG_LIMIT = 48
 private const val ONNX_INFERENCE_LOG_INTERVAL_MS = 3000L
+private const val KMBOX_NET_DEFAULT_PORT = 6234
+private const val KMBOX_NET_DEFAULT_MONITOR_PORT = 6235
+private const val KMBOX_NET_CONNECT_TIMEOUT_MS = 700
+private const val KMBOX_NET_MONITOR_TIMEOUT_MS = 300
+private const val KMBOX_NET_CMD_CONNECT = 0xAF3C2828.toInt()
+private const val KMBOX_NET_CMD_MOUSE_MOVE = 0xAEDE7345.toInt()
+private const val KMBOX_NET_CMD_MOUSE_LEFT = 0x9823AE8D.toInt()
+private const val KMBOX_NET_CMD_MOUSE_RIGHT = 0x238D8212
+private const val KMBOX_NET_CMD_MOUSE_MIDDLE = 0x97A3AE8D.toInt()
+private const val KMBOX_NET_CMD_MONITOR = 0x27388020
+private const val KMBOX_NET_MONITOR_MAGIC = 0xAA550000.toInt()
+
+enum class InputBackend(val label: String) {
+    MakcuUsb("MAKCU USB"),
+    KmboxNet("KMBOX NET")
+}
 
 enum class ModelKind { NCNN, ONNX, FILE }
 
@@ -220,6 +236,13 @@ data class StreamStats(
     val bytesPerSec: Long = 0,
     val targetCount: Int = 0,
     val latencyMs: Int = 0
+)
+
+data class KmboxNetConfig(
+    val ip: String = "",
+    val port: Int = KMBOX_NET_DEFAULT_PORT,
+    val uuid: String = "",
+    val monitorPort: Int = KMBOX_NET_DEFAULT_MONITOR_PORT
 )
 
 data class NcnnObject(val x: Float, val y: Float, val w: Float, val h: Float, val label: Int, val prob: Float)
@@ -1297,6 +1320,7 @@ private object RuntimeBridge {
     private val autoFireScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val moveQueue = Channel<Pair<Int, Int>>(Channel.CONFLATED)
     private val sessionRef = AtomicReference<MakcuUsbSession?>(null)
+    private val kmboxSessionRef = AtomicReference<KmboxNetSession?>(null)
     private val lastMoveErrorMs = AtomicLong(0L)
     private val lastButtonErrorMs = AtomicLong(0L)
     private val autoFireLock = Any()
@@ -1313,17 +1337,24 @@ private object RuntimeBridge {
                 val (dx, dy) = moveQueue.receive()
                 if (dx == 0 && dy == 0) continue
                 runCatching {
-                    val session = sessionRef.get()
-                    val result = when {
-                        session != null -> session.sendMoveSmart(dx, dy)
-                        MakcuSerialEngine.isConnected() -> MakcuSerialEngine.sendMove(dx, dy)
-                        else -> UsbSendResult(success = false, message = "未连接")
+                    val makcuSession = sessionRef.get()
+                    val kmboxSession = kmboxSessionRef.get()
+                    val result = when (InputBackendRuntime.selectedBackend) {
+                        InputBackend.KmboxNet -> when {
+                            kmboxSession != null -> kmboxSession.sendMove(dx, dy)
+                            else -> UsbSendResult(success = false, message = "KMBOX NET 未连接")
+                        }
+                        InputBackend.MakcuUsb -> when {
+                            makcuSession != null -> makcuSession.sendMoveSmart(dx, dy)
+                            MakcuSerialEngine.isConnected() -> MakcuSerialEngine.sendMove(dx, dy)
+                            else -> UsbSendResult(success = false, message = "MAKCU 未连接")
+                        }
                     }
                     if (!result.success) {
                         val now = System.currentTimeMillis()
                         val last = lastMoveErrorMs.get()
                         if (now - last > 1200 && lastMoveErrorMs.compareAndSet(last, now)) {
-                            MakcuLinkRuntime.updateStatus("联动写入失败: ${result.message}")
+                            InputBackendRuntime.updateStatus("联动写入失败: ${result.message}")
                         }
                     }
                 }
@@ -1394,9 +1425,13 @@ private object RuntimeBridge {
         sessionRef.set(session)
     }
 
+    fun bindKmboxSession(session: KmboxNetSession?) {
+        kmboxSessionRef.set(session)
+    }
+
     fun sendMove(dx: Int, dy: Int) {
         if (dx == 0 && dy == 0) return
-        if (sessionRef.get() == null && !MakcuSerialEngine.isConnected()) return
+        if (!InputBackendRuntime.isConnected()) return
         moveQueue.trySend(dx to dy)
     }
 
@@ -1421,11 +1456,23 @@ private object RuntimeBridge {
     fun autoFireState(): String = autoFireStatus
 
     private suspend fun sendFireButton(pressed: Boolean): UsbSendResult {
-        val session = sessionRef.get()
-        val result = when {
-            session != null -> session.sendMouseButton(0x01, pressed)
-            MakcuSerialEngine.isConnected() -> MakcuSerialEngine.sendMouseButton(0x01, pressed)
-            else -> UsbSendResult(success = false, message = "未连接")
+        val result = when (InputBackendRuntime.selectedBackend) {
+            InputBackend.KmboxNet -> {
+                val session = kmboxSessionRef.get()
+                if (session != null) {
+                    session.sendMouseButton(0x01, pressed)
+                } else {
+                    UsbSendResult(success = false, message = "KMBOX NET 未连接")
+                }
+            }
+            InputBackend.MakcuUsb -> {
+                val session = sessionRef.get()
+                when {
+                    session != null -> session.sendMouseButton(0x01, pressed)
+                    MakcuSerialEngine.isConnected() -> MakcuSerialEngine.sendMouseButton(0x01, pressed)
+                    else -> UsbSendResult(success = false, message = "MAKCU 未连接")
+                }
+            }
         }
         if (result.success) {
             fireButtonPressed = pressed
@@ -1434,7 +1481,7 @@ private object RuntimeBridge {
             val now = System.currentTimeMillis()
             val last = lastButtonErrorMs.get()
             if (now - last > 1500 && lastButtonErrorMs.compareAndSet(last, now)) {
-                MakcuLinkRuntime.updateStatus("自动射击写入失败: ${result.message}")
+                InputBackendRuntime.updateStatus("自动射击写入失败: ${result.message}")
             }
         }
         return result
@@ -2028,6 +2075,32 @@ private data class MakcuLinkState(
     val status: String = "未连接"
 )
 
+private object InputBackendRuntime {
+    @Volatile
+    var selectedBackend: InputBackend = InputBackend.MakcuUsb
+
+    fun currentButtonMask(): Int {
+        return when (selectedBackend) {
+            InputBackend.MakcuUsb -> MakcuLinkRuntime.state.value.buttonMask
+            InputBackend.KmboxNet -> KmboxNetRuntime.state.value.buttonMask
+        } and 0x1F
+    }
+
+    fun isConnected(): Boolean {
+        return when (selectedBackend) {
+            InputBackend.MakcuUsb -> MakcuLinkRuntime.state.value.connected
+            InputBackend.KmboxNet -> KmboxNetRuntime.state.value.connected
+        }
+    }
+
+    fun updateStatus(status: String) {
+        when (selectedBackend) {
+            InputBackend.MakcuUsb -> MakcuLinkRuntime.updateStatus(status)
+            InputBackend.KmboxNet -> KmboxNetRuntime.updateStatus(status)
+        }
+    }
+}
+
 private object MakcuLinkRuntime {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val sessionRef = AtomicReference<MakcuUsbSession?>(null)
@@ -2366,6 +2439,280 @@ private object MakcuLinkRuntime {
         } else {
             MakcuLinkState(status = reason)
         }
+    }
+}
+
+private data class KmboxMonitorEvent(
+    val rawButtons: Int,
+    val dx: Int,
+    val dy: Int,
+    val wheel: Int
+)
+
+private class KmboxNetSession private constructor(
+    private val commandSocket: DatagramSocket,
+    private val monitorSocket: DatagramSocket,
+    private val targetAddress: InetSocketAddress,
+    private val mac: Int,
+    private val rand: Int,
+    private val monitorPort: Int,
+    val ip: String,
+    val port: Int,
+    val uuid: String
+) {
+    private val sendLock = Any()
+    private var indexpts: Int = 0
+    @Volatile private var lastCommandLabel: String = "connect"
+    @Volatile private var lastMonitorPreview: String = ""
+    @Volatile private var lastMonitorAtMs: Long = System.currentTimeMillis()
+
+    companion object {
+        fun connect(config: KmboxNetConfig): KmboxNetSession {
+            val normalizedIp = config.ip.trim()
+            require(normalizedIp.isNotBlank()) { "IP 不能为空" }
+            val normalizedUuid = normalizeKmboxUuid(config.uuid)
+            val mac = normalizedUuid.toLong(16).toInt()
+
+            val commandSocket = DatagramSocket(null).apply {
+                soTimeout = KMBOX_NET_CONNECT_TIMEOUT_MS
+                connect(InetSocketAddress(normalizedIp, config.port.coerceIn(1, 65535)))
+            }
+            val monitorSocket = DatagramSocket(null).apply {
+                soTimeout = KMBOX_NET_MONITOR_TIMEOUT_MS
+                reuseAddress = true
+                bind(InetSocketAddress(config.monitorPort.coerceIn(1, 65535)))
+            }
+
+            try {
+                val target = InetSocketAddress(normalizedIp, config.port.coerceIn(1, 65535))
+                val connectPacket = buildKmboxHeader(
+                    mac = mac,
+                    rand = 0,
+                    indexpts = 0,
+                    cmd = KMBOX_NET_CMD_CONNECT
+                )
+                commandSocket.send(DatagramPacket(connectPacket, connectPacket.size, target))
+                val response = ByteArray(64)
+                val reply = DatagramPacket(response, response.size)
+                commandSocket.receive(reply)
+                val rand = parseKmboxConnectReply(response, reply.length)
+                    ?: error("握手失败：未收到随机值")
+
+                val session = KmboxNetSession(
+                    commandSocket = commandSocket,
+                    monitorSocket = monitorSocket,
+                    targetAddress = target,
+                    mac = mac,
+                    rand = rand,
+                    monitorPort = config.monitorPort.coerceIn(1, 65535),
+                    ip = normalizedIp,
+                    port = config.port.coerceIn(1, 65535),
+                    uuid = normalizedUuid
+                )
+                val monitorResult = session.startMonitor()
+                if (!monitorResult.success) {
+                    error("启动监控失败: ${monitorResult.message}")
+                }
+                return session
+            } catch (t: Throwable) {
+                runCatching { commandSocket.close() }
+                runCatching { monitorSocket.close() }
+                throw t
+            }
+        }
+    }
+
+    fun sendMove(dx: Int, dy: Int): UsbSendResult {
+        val payload = ByteBuffer.allocate(16)
+            .order(ByteOrder.LITTLE_ENDIAN)
+            .putInt(0)
+            .putInt(dx)
+            .putInt(dy)
+            .putInt(0)
+            .array()
+        return sendPacket(KMBOX_NET_CMD_MOUSE_MOVE, payload, "move($dx,$dy)")
+    }
+
+    fun sendMouseButton(buttonMask: Int, pressed: Boolean): UsbSendResult {
+        val cmd = when (buttonMask and 0x1F) {
+            0x01 -> KMBOX_NET_CMD_MOUSE_LEFT
+            0x02 -> KMBOX_NET_CMD_MOUSE_RIGHT
+            0x04 -> KMBOX_NET_CMD_MOUSE_MIDDLE
+            else -> return UsbSendResult(success = false, message = "KMBOX NET 暂不支持该按键: 0x${(buttonMask and 0x1F).toString(16).uppercase(Locale.US)}")
+        }
+        val payload = ByteBuffer.allocate(4)
+            .order(ByteOrder.LITTLE_ENDIAN)
+            .putInt(if (pressed) 1 else 0)
+            .array()
+        return sendPacket(cmd, payload, "button(${buttonMask and 0x1F},${if (pressed) 1 else 0})")
+    }
+
+    fun startMonitor(): UsbSendResult {
+        val monitorRand = KMBOX_NET_MONITOR_MAGIC or (monitorPort and 0xFFFF)
+        return sendPacket(KMBOX_NET_CMD_MONITOR, payload = byteArrayOf(), label = "monitor($monitorPort)", customRand = monitorRand)
+    }
+
+    fun readMonitorEvent(timeoutMs: Int = KMBOX_NET_MONITOR_TIMEOUT_MS): KmboxMonitorEvent? {
+        monitorSocket.soTimeout = timeoutMs.coerceAtLeast(1)
+        val buffer = ByteArray(32)
+        val packet = DatagramPacket(buffer, buffer.size)
+        return try {
+            monitorSocket.receive(packet)
+            val data = packet.data.copyOf(packet.length)
+            if (data.size < 6) return null
+            val buttons = (((data[1].toInt() and 0xFF) shl 8) or (data[0].toInt() and 0xFF))
+            val dx = (((data[3].toInt() and 0xFF) shl 8) or (data[2].toInt() and 0xFF)).toShort().toInt()
+            val dy = (((data[5].toInt() and 0xFF) shl 8) or (data[4].toInt() and 0xFF)).toShort().toInt()
+            val wheel = if (data.size >= 8) {
+                (((data[7].toInt() and 0xFF) shl 8) or (data[6].toInt() and 0xFF)).toShort().toInt()
+            } else {
+                0
+            }
+            lastMonitorAtMs = System.currentTimeMillis()
+            lastMonitorPreview = "btn=0x${((buttons ushr 8) and 0x1F).toString(16).uppercase(Locale.US)} dx=$dx dy=$dy wh=$wheel"
+            KmboxMonitorEvent(
+                rawButtons = (buttons ushr 8) and 0x1F,
+                dx = dx,
+                dy = dy,
+                wheel = wheel
+            )
+        } catch (_: SocketTimeoutException) {
+            null
+        }
+    }
+
+    fun debugSummary(): String {
+        val ageMs = (System.currentTimeMillis() - lastMonitorAtMs).coerceAtLeast(0L)
+        return "KMBOX $ip:$port uuid=$uuid mon=$monitorPort idx=$indexpts cmd=$lastCommandLabel rx=${ageMs}ms ${lastMonitorPreview.ifBlank { "waiting" }}"
+    }
+
+    fun close() {
+        runCatching { commandSocket.close() }
+        runCatching { monitorSocket.close() }
+    }
+
+    private fun sendPacket(cmd: Int, payload: ByteArray, label: String, customRand: Int? = null): UsbSendResult {
+        return synchronized(sendLock) {
+            runCatching {
+                val packet = buildKmboxPacket(
+                    mac = mac,
+                    rand = customRand ?: rand,
+                    indexpts = indexpts,
+                    cmd = cmd,
+                    payload = payload
+                )
+                commandSocket.send(DatagramPacket(packet, packet.size, targetAddress))
+                lastCommandLabel = label
+                indexpts = indexpts.inc()
+                UsbSendResult(success = true, message = label)
+            }.getOrElse { t ->
+                val detail = t.message?.take(80)?.ifBlank { null } ?: t.javaClass.simpleName
+                UsbSendResult(success = false, message = detail)
+            }
+        }
+    }
+}
+
+private object KmboxNetRuntime {
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val sessionRef = AtomicReference<KmboxNetSession?>(null)
+    private var sessionJob: Job? = null
+    private val _state = MutableStateFlow(MakcuLinkState(status = "未连接"))
+    val state: StateFlow<MakcuLinkState> = _state.asStateFlow()
+
+    fun session(): KmboxNetSession? = sessionRef.get()
+
+    fun updateStatus(status: String) {
+        _state.value = _state.value.copy(status = status)
+    }
+
+    fun connect(config: KmboxNetConfig) {
+        disconnect(reason = "正在切换通道...")
+        _state.value = MakcuLinkState(
+            connected = false,
+            rawButtonMask = 0,
+            buttonMask = 0,
+            debugInfo = "",
+            status = "正在连接 KMBOX NET..."
+        )
+        sessionJob = scope.launch {
+            var opened: KmboxNetSession? = null
+            var lastMaskUpdateMs = System.currentTimeMillis()
+            var timeoutCount = 0
+            try {
+                opened = KmboxNetSession.connect(config)
+                sessionRef.set(opened)
+                RuntimeBridge.bindKmboxSession(opened)
+                _state.value = _state.value.copy(
+                    connected = true,
+                    status = "KMBOX NET 已连接 ${opened.ip}:${opened.port} uuid=${opened.uuid} monitor=${config.monitorPort}",
+                    debugInfo = opened.debugSummary()
+                )
+
+                while (isActive) {
+                    val event = opened.readMonitorEvent()
+                    if (event == null) {
+                        timeoutCount++
+                        if (timeoutCount % 6 == 0) {
+                            _state.value = _state.value.copy(debugInfo = opened.debugSummary())
+                        }
+                        val holding = (_state.value.buttonMask and 0x1F) != 0
+                        if (
+                            holding &&
+                            HoldSafetyConfig.enableStuckHoldRecovery &&
+                            System.currentTimeMillis() - lastMaskUpdateMs >= HoldSafetyConfig.recoveryTimeoutMs
+                        ) {
+                            lastMaskUpdateMs = System.currentTimeMillis()
+                            _state.value = _state.value.copy(
+                                rawButtonMask = 0,
+                                buttonMask = 0,
+                                debugInfo = opened.debugSummary(),
+                                status = "安全回退：KMBOX 监控超时，已清零按键状态"
+                            )
+                        }
+                        continue
+                    }
+                    timeoutCount = 0
+                    lastMaskUpdateMs = System.currentTimeMillis()
+                    val rawMask = sanitizeRawMouseButtonMask(event.rawButtons)
+                    _state.value = _state.value.copy(
+                        connected = true,
+                        rawButtonMask = rawMask,
+                        buttonMask = normalizeMouseButtonMask(rawMask),
+                        debugInfo = opened.debugSummary()
+                    )
+                }
+            } catch (cancel: CancellationException) {
+                throw cancel
+            } catch (t: Throwable) {
+                val detail = t.message?.take(120)?.ifBlank { null } ?: t.javaClass.simpleName
+                _state.value = _state.value.copy(
+                    connected = false,
+                    rawButtonMask = 0,
+                    buttonMask = 0,
+                    debugInfo = "",
+                    status = "KMBOX NET 连接失败: $detail"
+                )
+            } finally {
+                val current = opened
+                if (current != null && sessionRef.compareAndSet(current, null)) {
+                    RuntimeBridge.bindKmboxSession(null)
+                    current.close()
+                }
+                if (_state.value.connected) {
+                    _state.value = _state.value.copy(connected = false, rawButtonMask = 0, buttonMask = 0, debugInfo = "")
+                }
+            }
+        }
+    }
+
+    fun disconnect(reason: String = "已断开") {
+        sessionJob?.cancel()
+        sessionJob = null
+        val old = sessionRef.getAndSet(null)
+        RuntimeBridge.bindKmboxSession(null)
+        old?.close()
+        _state.value = MakcuLinkState(status = reason)
     }
 }
 
@@ -3019,7 +3366,7 @@ class GameSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.Ca
                                     canvas.drawCircle(centerX, centerY, rangeRadius, aimRangePaint)
                                 }
 
-                                val currentButtonMask = MakcuLinkRuntime.state.value.buttonMask and 0x1F
+                                val currentButtonMask = InputBackendRuntime.currentButtonMask()
                                 val aimCfg = RuntimeBridge.pickAimbotConfig(currentButtonMask)
                                 if (aimCfg?.enabled == true && tracked.isNotEmpty()) {
                                     pidX.kp = AimPdConfig.xKp
@@ -3272,6 +3619,11 @@ fun MainApp() {
     var showPdOverlay by rememberSaveable { mutableStateOf(true) }
     var showDeviceDebug by rememberSaveable { mutableStateOf(false) }
     var enableStuckHoldRecovery by rememberSaveable { mutableStateOf(false) }
+    var selectedInputBackend by rememberSaveable { mutableStateOf(InputBackend.MakcuUsb) }
+    var kmboxIp by rememberSaveable { mutableStateOf("") }
+    var kmboxPort by rememberSaveable { mutableStateOf(KMBOX_NET_DEFAULT_PORT.toString()) }
+    var kmboxUuid by rememberSaveable { mutableStateOf("") }
+    var kmboxMonitorPort by rememberSaveable { mutableStateOf(KMBOX_NET_DEFAULT_MONITOR_PORT.toString()) }
 
     val modelOptions = remember { mutableStateListOf<ModelEntry>() }
     val onnxRuntimeLogs by OnnxEngine.runtimeLogs.collectAsState()
@@ -3363,6 +3715,11 @@ fun MainApp() {
         put("showPdOverlay", showPdOverlay)
         put("showDeviceDebug", showDeviceDebug)
         put("enableStuckHoldRecovery", enableStuckHoldRecovery)
+        put("inputBackend", selectedInputBackend.name)
+        put("kmboxIp", kmboxIp)
+        put("kmboxPort", kmboxPort.toIntOrNull()?.coerceIn(1, 65535) ?: KMBOX_NET_DEFAULT_PORT)
+        put("kmboxUuid", kmboxUuid.trim())
+        put("kmboxMonitorPort", kmboxMonitorPort.toIntOrNull()?.coerceIn(1, 65535) ?: KMBOX_NET_DEFAULT_MONITOR_PORT)
         put("hotkeys", JSONArray().apply { hotkeys.forEach { put(hotkeyToJson(it)) } })
     }
 
@@ -3402,6 +3759,13 @@ fun MainApp() {
         showPdOverlay = root.optBoolean("showPdOverlay", true)
         showDeviceDebug = root.optBoolean("showDeviceDebug", false)
         enableStuckHoldRecovery = root.optBoolean("enableStuckHoldRecovery", false)
+        selectedInputBackend = runCatching {
+            InputBackend.valueOf(root.optString("inputBackend", InputBackend.MakcuUsb.name))
+        }.getOrDefault(InputBackend.MakcuUsb)
+        kmboxIp = root.optString("kmboxIp", "").trim()
+        kmboxPort = root.optInt("kmboxPort", KMBOX_NET_DEFAULT_PORT).coerceIn(1, 65535).toString()
+        kmboxUuid = root.optString("kmboxUuid", "").trim()
+        kmboxMonitorPort = root.optInt("kmboxMonitorPort", KMBOX_NET_DEFAULT_MONITOR_PORT).coerceIn(1, 65535).toString()
 
         val parsed = parseHotkeys(root.optJSONArray("hotkeys"))
         hotkeys.clear()
@@ -3532,6 +3896,9 @@ fun MainApp() {
         DebugRenderConfig.showDeviceDebug = showDeviceDebug
         HoldSafetyConfig.enableStuckHoldRecovery = enableStuckHoldRecovery
     }
+    LaunchedEffect(selectedInputBackend) {
+        InputBackendRuntime.selectedBackend = selectedInputBackend
+    }
     LaunchedEffect(
         trackingEnabled,
         trackingConfirmThreshold,
@@ -3639,6 +4006,11 @@ fun MainApp() {
                         showPdOverlay = showPdOverlay,
                         showDeviceDebug = showDeviceDebug,
                         enableStuckHoldRecovery = enableStuckHoldRecovery,
+                        selectedInputBackend = selectedInputBackend,
+                        kmboxIp = kmboxIp,
+                        kmboxPort = kmboxPort,
+                        kmboxUuid = kmboxUuid,
+                        kmboxMonitorPort = kmboxMonitorPort,
                         onHotkeyChanged = { index, item -> hotkeys[index] = item },
                         onAimRangeEnabledChange = { aimRangeEnabled = it },
                         onAimRangePercentChange = { aimRangePercent = it.coerceIn(0f, 100f) },
@@ -3654,7 +4026,16 @@ fun MainApp() {
                         onYMaxOutChange = { yMaxOutInput = filterIntInput(it) },
                         onShowPdOverlayChange = { showPdOverlay = it },
                         onShowDeviceDebugChange = { showDeviceDebug = it },
-                        onEnableStuckHoldRecoveryChange = { enableStuckHoldRecovery = it }
+                        onEnableStuckHoldRecoveryChange = { enableStuckHoldRecovery = it },
+                        onSelectedInputBackendChange = { selectedInputBackend = it },
+                        onKmboxIpChange = { kmboxIp = it.trim() },
+                        onKmboxPortChange = { kmboxPort = filterIntInput(it) },
+                        onKmboxUuidChange = {
+                            kmboxUuid = it.uppercase(Locale.US)
+                                .filter { ch -> ch.isDigit() || ch in 'A'..'F' }
+                                .take(8)
+                        },
+                        onKmboxMonitorPortChange = { kmboxMonitorPort = filterIntInput(it) }
                     )
                     AppTab.Function -> FunctionScreen(
                         trackingEnabled = trackingEnabled,
@@ -4215,6 +4596,11 @@ fun InputControlScreen(
     showPdOverlay: Boolean,
     showDeviceDebug: Boolean,
     enableStuckHoldRecovery: Boolean,
+    selectedInputBackend: InputBackend,
+    kmboxIp: String,
+    kmboxPort: String,
+    kmboxUuid: String,
+    kmboxMonitorPort: String,
     onHotkeyChanged: (Int, HotkeyConfig) -> Unit,
     onAimRangeEnabledChange: (Boolean) -> Unit,
     onAimRangePercentChange: (Float) -> Unit,
@@ -4230,7 +4616,12 @@ fun InputControlScreen(
     onYMaxOutChange: (String) -> Unit,
     onShowPdOverlayChange: (Boolean) -> Unit,
     onShowDeviceDebugChange: (Boolean) -> Unit,
-    onEnableStuckHoldRecoveryChange: (Boolean) -> Unit
+    onEnableStuckHoldRecoveryChange: (Boolean) -> Unit,
+    onSelectedInputBackendChange: (InputBackend) -> Unit,
+    onKmboxIpChange: (String) -> Unit,
+    onKmboxPortChange: (String) -> Unit,
+    onKmboxUuidChange: (String) -> Unit,
+    onKmboxMonitorPortChange: (String) -> Unit
 ) {
     val tabs = listOf("设备连接", "热键1", "热键2", "热键3", "控制参数")
     val pagerState = rememberPagerState(pageCount = { tabs.size })
@@ -4279,8 +4670,18 @@ fun InputControlScreen(
             ) {
                 when (page) {
                     0 -> DeviceConnectTab(
+                        selectedInputBackend = selectedInputBackend,
+                        kmboxIp = kmboxIp,
+                        kmboxPort = kmboxPort,
+                        kmboxUuid = kmboxUuid,
+                        kmboxMonitorPort = kmboxMonitorPort,
                         showDeviceDebug = showDeviceDebug,
                         enableStuckHoldRecovery = enableStuckHoldRecovery,
+                        onSelectedInputBackendChange = onSelectedInputBackendChange,
+                        onKmboxIpChange = onKmboxIpChange,
+                        onKmboxPortChange = onKmboxPortChange,
+                        onKmboxUuidChange = onKmboxUuidChange,
+                        onKmboxMonitorPortChange = onKmboxMonitorPortChange,
                         onShowDeviceDebugChange = onShowDeviceDebugChange,
                         onEnableStuckHoldRecoveryChange = onEnableStuckHoldRecoveryChange
                     )
@@ -4331,14 +4732,26 @@ fun InputControlScreen(
 
 @Composable
 private fun DeviceConnectTab(
+    selectedInputBackend: InputBackend,
+    kmboxIp: String,
+    kmboxPort: String,
+    kmboxUuid: String,
+    kmboxMonitorPort: String,
     showDeviceDebug: Boolean,
     enableStuckHoldRecovery: Boolean,
+    onSelectedInputBackendChange: (InputBackend) -> Unit,
+    onKmboxIpChange: (String) -> Unit,
+    onKmboxPortChange: (String) -> Unit,
+    onKmboxUuidChange: (String) -> Unit,
+    onKmboxMonitorPortChange: (String) -> Unit,
     onShowDeviceDebugChange: (Boolean) -> Unit,
     onEnableStuckHoldRecoveryChange: (Boolean) -> Unit
 ) {
     val context = LocalContext.current
     val usbManager = remember(context) { context.getSystemService(Context.USB_SERVICE) as? UsbManager }
-    val linkState by MakcuLinkRuntime.state.collectAsState()
+    val makcuLinkState by MakcuLinkRuntime.state.collectAsState()
+    val kmboxLinkState by KmboxNetRuntime.state.collectAsState()
+    val linkState = if (selectedInputBackend == InputBackend.MakcuUsb) makcuLinkState else kmboxLinkState
     var usbDevices by remember { mutableStateOf(listOf<UsbDevice>()) }
     var selectedDeviceId by rememberSaveable { mutableIntStateOf(-1) }
     var drawDelayMs by rememberSaveable { mutableFloatStateOf(MakcuTestConfig.drawStepDelayMs.toFloat()) }
@@ -4373,6 +4786,35 @@ private fun DeviceConnectTab(
     }
     LaunchedEffect(drawDelayMs) {
         MakcuTestConfig.drawStepDelayMs = drawDelayMs.roundToInt().coerceIn(2, 22).toLong()
+    }
+
+    Text("输入后端", fontWeight = FontWeight.Bold, fontSize = 16.sp, color = Color(0xFF4A4A4A))
+    InputSegmentedControl(
+        options = InputBackend.entries.map { it.label },
+        selectedIndex = InputBackend.entries.indexOf(selectedInputBackend).coerceAtLeast(0),
+        onSelect = { index -> onSelectedInputBackendChange(InputBackend.entries[index]) },
+        fontSize = 13.sp
+    )
+
+    if (selectedInputBackend == InputBackend.KmboxNet) {
+        KmboxNetConnectTab(
+            kmboxIp = kmboxIp,
+            kmboxPort = kmboxPort,
+            kmboxUuid = kmboxUuid,
+            kmboxMonitorPort = kmboxMonitorPort,
+            drawDelayMs = drawDelayMs,
+            showDeviceDebug = showDeviceDebug,
+            enableStuckHoldRecovery = enableStuckHoldRecovery,
+            linkState = linkState,
+            onKmboxIpChange = onKmboxIpChange,
+            onKmboxPortChange = onKmboxPortChange,
+            onKmboxUuidChange = onKmboxUuidChange,
+            onKmboxMonitorPortChange = onKmboxMonitorPortChange,
+            onDrawDelayChange = { drawDelayMs = it },
+            onShowDeviceDebugChange = onShowDeviceDebugChange,
+            onEnableStuckHoldRecoveryChange = onEnableStuckHoldRecoveryChange
+        )
+        return
     }
 
     fun refreshUsbDevices(): List<UsbDevice> {
@@ -4917,6 +5359,246 @@ private fun DeviceConnectTab(
                     fontSize = 12.sp,
                     fontWeight = FontWeight.Bold,
                     modifier = Modifier.clickable(enabled = !hasPermission) { requestPermission(device) }
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun KmboxNetConnectTab(
+    kmboxIp: String,
+    kmboxPort: String,
+    kmboxUuid: String,
+    kmboxMonitorPort: String,
+    drawDelayMs: Float,
+    showDeviceDebug: Boolean,
+    enableStuckHoldRecovery: Boolean,
+    linkState: MakcuLinkState,
+    onKmboxIpChange: (String) -> Unit,
+    onKmboxPortChange: (String) -> Unit,
+    onKmboxUuidChange: (String) -> Unit,
+    onKmboxMonitorPortChange: (String) -> Unit,
+    onDrawDelayChange: (Float) -> Unit,
+    onShowDeviceDebugChange: (Boolean) -> Unit,
+    onEnableStuckHoldRecoveryChange: (Boolean) -> Unit
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val panelColor = Color(0xFFEFEFEF)
+    val connected = linkState.connected
+    val rawMaskHex = "0x${(linkState.rawButtonMask and 0xFFFF).toString(16).uppercase(Locale.US)}"
+    val mappedMaskHex = "0x${(linkState.buttonMask and 0x1F).toString(16).uppercase(Locale.US)}"
+
+    fun connectKmbox() {
+        val port = kmboxPort.toIntOrNull()?.coerceIn(1, 65535) ?: KMBOX_NET_DEFAULT_PORT
+        val monitorPort = kmboxMonitorPort.toIntOrNull()?.coerceIn(1, 65535) ?: KMBOX_NET_DEFAULT_MONITOR_PORT
+        val config = try {
+            KmboxNetConfig(
+                ip = kmboxIp.trim(),
+                port = port,
+                uuid = normalizeKmboxUuid(kmboxUuid),
+                monitorPort = monitorPort
+            )
+        } catch (t: Throwable) {
+            val detail = t.message?.take(80)?.ifBlank { null } ?: "参数无效"
+            Toast.makeText(context, detail, Toast.LENGTH_SHORT).show()
+            return
+        }
+        scope.launch {
+            withContext(Dispatchers.IO) {
+                KmboxNetRuntime.connect(config)
+            }
+        }
+    }
+
+    fun sendDrawPattern(pattern: MakcuDrawPattern) {
+        val session = KmboxNetRuntime.session()
+        if (session == null) {
+            Toast.makeText(context, "请先连接 KMBOX NET", Toast.LENGTH_SHORT).show()
+            return
+        }
+        scope.launch {
+            val result = withContext(Dispatchers.IO) { sendKmboxDrawPattern(session, pattern) }
+            val status = if (result.success) "最近发送: ${result.message}" else "发送失败: ${result.message}"
+            KmboxNetRuntime.updateStatus(status)
+            Toast.makeText(context, status, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    Card(colors = CardDefaults.cardColors(containerColor = panelColor), shape = RoundedCornerShape(16.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 16.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("●", color = if (connected) Color(0xFF4CAF50) else Color(0xFFC5C5C5), fontSize = 14.sp)
+            Spacer(Modifier.width(10.dp))
+            Text(if (connected) "KMBOX 已连接" else "KMBOX 未连接", fontWeight = FontWeight.SemiBold, color = Color(0xFF4A4A4A), fontSize = 16.sp)
+            Spacer(Modifier.weight(1f))
+            if (connected) {
+                TextButton(onClick = { KmboxNetRuntime.disconnect("已断开") }) {
+                    Text("断开", color = Color(0xFFD32F2F), fontSize = 12.sp)
+                }
+            } else {
+                TextButton(onClick = { connectKmbox() }) {
+                    Text("连接", color = Color(0xFF2E7D32), fontSize = 12.sp)
+                }
+            }
+        }
+    }
+
+    Card(colors = CardDefaults.cardColors(containerColor = panelColor), shape = RoundedCornerShape(16.dp)) {
+        Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("KMBOX NET 配置", fontWeight = FontWeight.Bold, fontSize = 14.sp, color = Color(0xFF333333))
+            OutlinedTextField(
+                value = kmboxIp,
+                onValueChange = onKmboxIpChange,
+                label = { Text("设备 IP") },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    value = kmboxPort,
+                    onValueChange = onKmboxPortChange,
+                    label = { Text("控制端口") },
+                    modifier = Modifier.weight(1f),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    singleLine = true
+                )
+                OutlinedTextField(
+                    value = kmboxMonitorPort,
+                    onValueChange = onKmboxMonitorPortChange,
+                    label = { Text("监听端口") },
+                    modifier = Modifier.weight(1f),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    singleLine = true
+                )
+            }
+            OutlinedTextField(
+                value = kmboxUuid,
+                onValueChange = onKmboxUuidChange,
+                label = { Text("UUID (8位十六进制)") },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true
+            )
+            Text("示例：IP `192.168.2.188`，控制端口 `6234`，监听端口建议 `6235`。", fontSize = 11.sp, color = Color(0xFF707070))
+        }
+    }
+
+    Card(colors = CardDefaults.cardColors(containerColor = panelColor), shape = RoundedCornerShape(16.dp)) {
+        Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Text("设备监控与测试", fontWeight = FontWeight.Bold, fontSize = 14.sp, color = Color(0xFF333333))
+
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+                MOUSE_BUTTON_INDICATORS.forEach { item ->
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Surface(
+                            shape = CircleShape,
+                            color = if ((linkState.buttonMask and item.mask) != 0) Color(0xFFCFDDCE) else Color(0xFFF5F5F5),
+                            border = BorderStroke(1.dp, Color(0xFFBFBFBF)),
+                            modifier = Modifier.size(26.dp)
+                        ) {}
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            item.label,
+                            fontSize = 11.sp,
+                            color = if ((linkState.buttonMask and item.mask) != 0) Color(0xFF2E7D32) else Color(0xFF555555)
+                        )
+                    }
+                }
+            }
+
+            val pressedNames = MOUSE_BUTTON_INDICATORS
+                .filter { (linkState.buttonMask and it.mask) != 0 }
+                .joinToString("、") { it.label }
+            Text(
+                text = if (pressedNames.isBlank()) "未检测到鼠标按键按下" else "检测到按下: $pressedNames",
+                fontSize = 11.sp,
+                color = Color(0xFF5E5E5E)
+            )
+            Text(
+                text = "RAW=$rawMaskHex  映射后=$mappedMaskHex",
+                fontSize = 11.sp,
+                color = Color(0xFF616161)
+            )
+
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Surface(
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(12.dp),
+                    color = Color(0xFFF5F5F5),
+                    border = BorderStroke(1.dp, Color(0xFFDDDDDD))
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text("调试模式", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF454545))
+                            Text("显示监控收包和发送摘要", fontSize = 10.sp, color = Color(0xFF757575))
+                        }
+                        InputGraySwitch(checked = showDeviceDebug, onCheckedChange = onShowDeviceDebugChange)
+                    }
+                }
+                Surface(
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(12.dp),
+                    color = Color(0xFFF5F5F5),
+                    border = BorderStroke(1.dp, Color(0xFFDDDDDD))
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text("安全回退", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF454545))
+                            Text("监控超时且长按时自动清零", fontSize = 10.sp, color = Color(0xFF757575))
+                        }
+                        InputGraySwitch(checked = enableStuckHoldRecovery, onCheckedChange = onEnableStuckHoldRecoveryChange)
+                    }
+                }
+            }
+
+            if (showDeviceDebug && linkState.debugInfo.isNotBlank()) {
+                Text(
+                    text = "协议调试: ${linkState.debugInfo}",
+                    fontSize = 10.sp,
+                    color = Color(0xFF757575)
+                )
+            }
+
+            HorizontalDivider(color = Color(0xFFDADADA), thickness = 1.dp)
+
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                OutlinedButton(
+                    onClick = { sendDrawPattern(MakcuDrawPattern.Square) },
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(1.dp, Color(0xFFBDBDBD))
+                ) { Text("画正方形", fontSize = 12.sp, color = Color(0xFF555555)) }
+                OutlinedButton(
+                    onClick = { sendDrawPattern(MakcuDrawPattern.Circle) },
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(1.dp, Color(0xFFBDBDBD))
+                ) { Text("画圆形", fontSize = 12.sp, color = Color(0xFF555555)) }
+            }
+            LabeledGraySlider(
+                title = "轨迹速度 (越快数值越小)",
+                valueLabel = "${drawDelayMs.roundToInt().coerceIn(2, 22)} ms/步",
+                value = drawDelayMs,
+                onValueChange = onDrawDelayChange,
+                valueRange = 2f..22f
+            )
+
+            if (linkState.status.isNotBlank()) {
+                Text(
+                    linkState.status,
+                    fontSize = 11.sp,
+                    color = if (linkState.status.contains("失败") || linkState.status.contains("异常")) Color(0xFFD32F2F) else Color(0xFF2E7D32)
                 )
             }
         }
@@ -6137,6 +6819,23 @@ private suspend fun sendMakcuDrawPatternSerial(pattern: MakcuDrawPattern): UsbSe
     return UsbSendResult(success = true, message = "${pattern.label} 串口发送成功(${moves.size}步)")
 }
 
+private suspend fun sendKmboxDrawPattern(session: KmboxNetSession, pattern: MakcuDrawPattern): UsbSendResult {
+    val stepDelayMs = MakcuTestConfig.drawStepDelayMs.coerceIn(2L, 22L)
+    val moves = when (pattern) {
+        MakcuDrawPattern.Square -> buildSquareMoves()
+        MakcuDrawPattern.Circle -> buildCircleMoves()
+    }
+    if (moves.isEmpty()) return UsbSendResult(success = false, message = "${pattern.label} 轨迹为空")
+    for ((index, move) in moves.withIndex()) {
+        val result = session.sendMove(move.first, move.second)
+        if (!result.success) {
+            return UsbSendResult(success = false, message = "${pattern.label} 第${index + 1}步失败: ${result.message}")
+        }
+        delay(stepDelayMs)
+    }
+    return UsbSendResult(success = true, message = "${pattern.label} KMBOX 发送成功(${moves.size}步)")
+}
+
 private fun openMakcuUsbSession(usbManager: UsbManager, device: UsbDevice): MakcuUsbSession? {
     if (!usbManager.hasPermission(device)) return null
     val candidates = findUsbIoCandidates(device)
@@ -7309,6 +8008,40 @@ private fun normalizeCategoryOrder(raw: List<Int>): List<Int> {
     val filtered = raw.filter { it in 0..3 }.distinct().toMutableList()
     for (i in 0..3) if (!filtered.contains(i)) filtered += i
     return filtered.take(4)
+}
+
+private fun normalizeKmboxUuid(raw: String): String {
+    val cleaned = raw.trim()
+        .removePrefix("0x")
+        .removePrefix("0X")
+        .replace(" ", "")
+        .uppercase(Locale.US)
+    require(cleaned.length == 8 && cleaned.all { it in '0'..'9' || it in 'A'..'F' }) { "UUID 需为 8 位十六进制" }
+    return cleaned
+}
+
+private fun buildKmboxHeader(mac: Int, rand: Int, indexpts: Int, cmd: Int): ByteArray {
+    return ByteBuffer.allocate(16)
+        .order(ByteOrder.LITTLE_ENDIAN)
+        .putInt(mac)
+        .putInt(rand)
+        .putInt(indexpts)
+        .putInt(cmd)
+        .array()
+}
+
+private fun buildKmboxPacket(mac: Int, rand: Int, indexpts: Int, cmd: Int, payload: ByteArray): ByteArray {
+    val header = buildKmboxHeader(mac, rand, indexpts, cmd)
+    return ByteBuffer.allocate(header.size + payload.size)
+        .order(ByteOrder.LITTLE_ENDIAN)
+        .put(header)
+        .put(payload)
+        .array()
+}
+
+private fun parseKmboxConnectReply(data: ByteArray, length: Int): Int? {
+    if (length < 8) return null
+    return ByteBuffer.wrap(data, 4, 4).order(ByteOrder.LITTLE_ENDIAN).int
 }
 
 private fun copyModelToPrivateDir(context: Context, uri: Uri): String? {
