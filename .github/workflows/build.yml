@@ -17,19 +17,21 @@ jobs:
         with:
           java-version: '17'
           distribution: 'temurin'
+          cache: gradle
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      # 👇 这一步就是解决 Permission denied 的关键！
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
+      # 关键：强制 Gradle 使用 Actions 提供的 JDK，忽略本地配置
       - name: Build APK
-        run: ./gradlew :app:assembleDebug
+        run: ./gradlew :app:assembleDebug -Dorg.gradle.java.home=$JAVA_HOME
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: HX_host-APK
           path: app/build/outputs/apk/debug/app-debug.apk
+
